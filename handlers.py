@@ -110,6 +110,50 @@ async def cmd_start(message: Message) -> None:
     await message.answer("Бот запущен и работает.")
 
 
+HELP_TEXT = (
+    "Что я умею.\n\n"
+    "В личке просто напиши вопрос — отвечу. В группе упомяни меня (@имя) "
+    "или ответь на моё сообщение.\n\n"
+    "Команды:\n"
+    "/start — проверка, что бот жив\n"
+    "/help — список команд\n"
+    "/model — какая модель отвечает\n"
+    "/reminders — активные напоминания\n"
+    "/edit_reminder ID [текст] [через ...] — изменить напоминание\n"
+    "/delete_reminder ID — удалить напоминание\n"
+    "/topic <тема> — тема ежедневного поста в группе, /topic off — выключить\n\n"
+    "Напоминание: напиши в личке «Напомни мне позвонить маме через 2 часа»."
+)
+
+HELP_ADMIN_TEXT = (
+    "\n\nДля админа:\n"
+    "/post_now — сразу отправить пост по теме (в группе)\n"
+    "/allow <id | @username | ответом> — разрешить пользователя\n"
+    "/disallow <id | @username | ответом> — убрать разрешение\n"
+    "/allowed — список разрешённых"
+)
+
+UNKNOWN_COMMAND_TEXT = "Не знаю такой команды. Список: /help"
+
+GROUP_ONLY_TEXT = "Эта команда работает только в группе."
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    text = HELP_TEXT
+    if message.from_user is not None and message.from_user.id == config.ADMIN_ID:
+        text += HELP_ADMIN_TEXT
+    await message.answer(text)
+
+
+@router.message(Command("model"))
+async def cmd_model(message: Message) -> None:
+    if not await is_allowed(message.from_user.id):
+        await message.answer(DENY_TEXT)
+        return
+    await message.answer(f"Модель: {config.LLM_MODEL}")
+
+
 @router.message(Command("allow"))
 async def cmd_allow(message: Message, command: CommandObject) -> None:
     if message.from_user.id != config.ADMIN_ID:
@@ -390,3 +434,12 @@ async def group_mention(message: Message) -> None:
     await message.reply(chunks[0])
     for chunk in chunks[1:]:
         await message.answer(chunk)
+
+
+@router.message(F.chat.type == "private", F.text.startswith("/"))
+async def unknown_command(message: Message) -> None:
+    command = message.text.split()[0].split("@")[0].lower()
+    if command in ("/topic", "/post_now"):
+        await message.answer(GROUP_ONLY_TEXT)
+        return
+    await message.answer(UNKNOWN_COMMAND_TEXT)
