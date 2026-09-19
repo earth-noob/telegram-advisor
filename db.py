@@ -56,6 +56,18 @@ _SCHEMA_STATEMENTS = [
         last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS photos (
+        id BIGSERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        file_id TEXT NOT NULL,
+        file_unique_id TEXT NOT NULL,
+        caption TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_photos_user ON photos (user_id, id DESC)",
 ]
 
 
@@ -415,4 +427,65 @@ async def restore_daily_post(chat_id: int, prev_date: date | None) -> None:
         "UPDATE chats SET daily_post_date = $2 WHERE chat_id = $1",
         chat_id,
         prev_date,
+    )
+
+
+async def save_photo(
+    chat_id: int,
+    user_id: int,
+    file_id: str,
+    file_unique_id: str,
+    caption: str | None,
+) -> int:
+    """Сохраняет ссылку на фото (file_id Telegram). Повтор того же фото возвращает прежний id."""
+    existing = await get_pool().fetchval(
+        """
+        SELECT id FROM photos
+        WHERE user_id = $1 AND file_unique_id = $2
+        ORDER BY id DESC LIMIT 1
+        """,
+        user_id,
+        file_unique_id,
+    )
+    if existing is not None:
+        return existing
+    return await get_pool().fetchval(
+        """
+        INSERT INTO photos (chat_id, user_id, file_id, file_unique_id, caption)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        chat_id,
+        user_id,
+        file_id,
+        file_unique_id,
+        caption,
+    )
+
+
+async def get_photo(photo_id: int, user_id: int) -> asyncpg.Record | None:
+    """Фото по id — только своё."""
+    return await get_pool().fetchrow(
+        """
+        SELECT id, file_id, caption, created_at
+        FROM photos
+        WHERE id = $1 AND user_id = $2
+        """,
+        photo_id,
+        user_id,
+    )
+
+
+async def list_photos(user_id: int, limit: int = 10) -> list[asyncpg.Record]:
+    """Последние сохранённые фото пользователя (новые первыми)."""
+    return await get_pool().fetch(
+        """
+        SELECT id, caption, created_at
+        FROM photos
+        WHERE user_id = $1
+        ORDER BY id DESC
+        LIMIT $2
+        """,
+        user_id,
+        limit,
     )
