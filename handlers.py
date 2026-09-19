@@ -1,11 +1,12 @@
 import logging
 import re
+from datetime import date
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message, User
+from aiogram.types import BufferedInputFile, Message, User
 from aiogram.utils.chat_action import ChatActionSender
 
 import config
@@ -121,7 +122,11 @@ HELP_TEXT = (
     "/reminders — активные напоминания\n"
     "/edit_reminder ID [текст] [через ...] — изменить напоминание\n"
     "/delete_reminder ID — удалить напоминание\n"
-    "/topic <тема> — тема ежедневного поста в группе, /topic off — выключить\n\n"
+    "/topic <тема> — тема ежедневного поста в группе, /topic off — выключить\n"
+    "/photos — сохранённые фото\n"
+    "/photo ID — показать сохранённое фото\n"
+    "/regen ID описание — новая версия фото через ИИ\n\n"
+    "Фото: пришли мне его в личку (как фото, не файлом) — сохраню и дам номер.\n"
     "Напоминание: напиши в личке «Напомни мне позвонить маме через 2 часа»."
 )
 
@@ -434,6 +439,206 @@ async def group_mention(message: Message) -> None:
     await message.reply(chunks[0])
     for chunk in chunks[1:]:
         await message.answer(chunk)
+
+
+PHOTO_SAVED_TEXT = (
+    "Сохранил фото #{id}. Новая версия через ИИ: /regen {id} описание "
+    "(или ответь на фото командой /regen описание)."
+)
+
+REGEN_USAGE_TEXT = (
+    "Использование:\n"
+    "/regen ID описание — по сохранённому фото\n"
+    "или ответь на фото командой /regen описание, "
+    "или пришли фото с подписью /regen описание.\n"
+    "Список фото: /photos"
+)
+
+REGEN_DEFAULT_PROMPT = (
+    "Создай новую версию этого изображения: сохрани сюжет и композицию, "
+    "но перерисуй его заново, с чуть другими деталями."
+)
+
+REGEN_DISABLED_TEXT = "Генерация картинок не настроена (нет переменной IMAGE_MODEL)."
+
+REGEN_ERROR_TEXT = "Не получилось сгенерировать изображение, попробуй ещё раз позже."
+
+REGEN_LIMIT_TEXT = "Дневной лимит генераций исчерпан ({limit}). Завтра можно снова."
+
+PHOTO_NOT_FOUND_TEXT = "Фото #{id} не найдено."
+
+NO_PHOTOS_TEXT = "Сохранённых фото нет. Просто пришли мне фото."
+
+_regen_counts: dict[tuple[int, date], int] = {}
+
+
+def _regen_try_take(user_id: int) -> bool:
+    """Списывает одну генерацию из дневного лимита; админ и лимит 0 — без ограничений."""
+    if user_id == config.ADMIN_ID or config.IMAGE_DAILY_LIMIT <= 0:
+        return True
+    today = utils.now().date()
+    for key in [k for k in _regen_counts if k[1] != today]:
+        del _regen_counts[key]
+    used = _regen_counts.get((user_id, today), 0)
+    if used >= config.IMAGE_DAILY_LIMIT:
+        return False
+    _regen_counts[(user_id, today)] = used + 1
+    return True
+
+
+def _regen_refund(user_id: int) -> None:
+    key = (user_id, utils.now().date())
+    if key in _regen_counts and _regen_counts[key] > 0:
+        _regen_counts[key] -= 1
+
+
+@router.message(F.chat.type == "private", F.photo)
+async def private_photo(message: Message) -> None:
+    if not await is_allowed(message.from_user.id):
+        await message.answer(DENY_TEXT)
+        return
+    photo = message.photo[-1]
+    photo_id = await db.save_photo(
+        message.chat.id,
+        message.from_user.id,
+        photo.file_id,
+        photo.file_unique_id,
+        message.caption,
+    )
+    await message.answer(PHOTO_SAVED_TEXT.format(id=photo_id))
+
+
+@router.message(Command("photos"), F.chat.type == "private")
+async def cmd_photos(message: Message) -> None:
+    if not await is_allowed(message.from_user.id):
+        await message.answer(DENY_TEXT)
+        return
+    rows = await db.list_photos(message.from_user.id, limit=10)
+    if not rows:
+        await message.answer(NO_PHOTOS_TEXT)
+        return
+    lines = ["🖼 Сохранённые фото (последние 10):", ""]
+    for row in rows:
+        caption = (row["caption"] or "").strip().replace("\n", " ")
+        if len(caption) > 40:
+            caption = caption[:40] + "…"
+        line = f"#{row['id']} — {utils.format_dt(row['created_at'])} МСК"
+        if caption:
+            line += f" — {caption}"
+        lines.append(line)
+    lines.append("")
+    lines.append("Показать: /photo ID. Новая версия: /regen ID описание")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("photo"), F.chat.type == "private")
+async def cmd_photo(message: Message, command: CommandObject) -> None:
+    if not await is_allowed(message.from_user.id):
+        await message.answer(DENY_TEXT)
+        return
+    args = (command.args or "").strip()
+    if not args.isdigit():
+        await message.answer("Использование: /photo ID (список: /photos)")
+        return
+    row = await db.get_photo(int(args), message.from_user.id)
+    if row is None:
+        await message.answer(PHOTO_NOT_FOUND_TEXT.format(id=args))
+        return
+    try:
+        await message.answer_photo(row["file_id"], caption=f"#{row['id']}")
+    except TelegramBadRequest:
+        log.exception("Не удалось отправить сохранённое фото #%s", row["id"])
+        await message.answer("Не удалось отправить это фото.")
+
+
+@router.message(Command("regen"), F.chat.type == "private")
+async def cmd_regen(message: Message, command: CommandObject) -> None:
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    if not await is_allowed(user_id):
+        await message.answer(DENY_TEXT)
+        return
+    if not config.IMAGE_MODEL:
+        await message.answer(REGEN_DISABLED_TEXT)
+        return
+
+    args = (command.args or "").strip()
+    source_photo = None
+    if message.photo:
+        source_photo = message.photo[-1]
+    elif message.reply_to_message is not None and message.reply_to_message.photo:
+        source_photo = message.reply_to_message.photo[-1]
+
+    if source_photo is not None:
+        file_id = source_photo.file_id
+        source_id = await db.save_photo(
+            chat_id, user_id, file_id, source_photo.file_unique_id, None
+        )
+        prompt = args
+    else:
+        parts = args.split(None, 1)
+        if not parts or not parts[0].isdigit():
+            await message.answer(REGEN_USAGE_TEXT)
+            return
+        source_id = int(parts[0])
+        row = await db.get_photo(source_id, user_id)
+        if row is None:
+            await message.answer(PHOTO_NOT_FOUND_TEXT.format(id=source_id))
+            return
+        file_id = row["file_id"]
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+
+    prompt = prompt or REGEN_DEFAULT_PROMPT
+
+    if not _regen_try_take(user_id):
+        await message.answer(REGEN_LIMIT_TEXT.format(limit=config.IMAGE_DAILY_LIMIT))
+        return
+
+    status = await message.answer("Генерирую, это может занять до пары минут…")
+    try:
+        async with ChatActionSender.upload_photo(chat_id=chat_id, bot=message.bot):
+            buffer = await message.bot.download(file_id)
+            image = buffer.read()
+            result = await llm.edit_image(image, prompt)
+    except TelegramBadRequest:
+        _regen_refund(user_id)
+        log.exception("Не удалось скачать фото #%s из Telegram", source_id)
+        await message.answer("Не удалось скачать фото из Telegram (возможно, файл слишком большой).")
+        return
+    except llm.LLMError as e:
+        _regen_refund(user_id)
+        log.exception("Ошибка генерации изображения для фото #%s", source_id)
+        text = REGEN_ERROR_TEXT
+        if user_id == config.ADMIN_ID:
+            text += f"\n\n{e}"
+        await message.answer(text)
+        return
+    finally:
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+
+    caption = f"Новая версия фото #{source_id}"
+    upload = BufferedInputFile(result, filename="regen.png")
+    try:
+        sent = await message.answer_photo(upload, caption=caption)
+    except TelegramBadRequest:
+        # слишком большая картинка для «фото» — отправим файлом
+        sent = await message.answer_document(
+            BufferedInputFile(result, filename="regen.png"), caption=caption
+        )
+
+    if sent.photo:
+        new_photo = sent.photo[-1]
+        new_id = await db.save_photo(
+            chat_id,
+            user_id,
+            new_photo.file_id,
+            new_photo.file_unique_id,
+            f"Новая версия #{source_id}",
+        )
+        await message.answer(f"Сохранил как #{new_id}. Ещё раз: /regen {new_id} описание")
 
 
 @router.message(F.chat.type == "private", F.text.startswith("/"))
